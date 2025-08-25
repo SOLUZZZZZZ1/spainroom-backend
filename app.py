@@ -1,139 +1,197 @@
-import os, io, uuid, base64, json, sqlite3
-from contextlib import closing
-from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+import os
+from datetime import datetime, date
+from flask import Flask, jsonify, request
+from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from PIL import Image, ImageOps
-from urllib.parse import urlparse
+from sqlalchemy import text as _text
+from config import Config
 
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
-DB_PATH = os.environ.get("DB_PATH", "rooms.db")
+db = SQLAlchemy()
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# ---------- MODELOS ----------
+class Room(db.Model):
+    __tablename__ = "rooms"
 
-ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
-MAX_CONTENT_LENGTH = 10 * 1024 * 1024
-TARGET_RATIO = 4 / 3
-SIZES = [1600, 1200, 800, 400]
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+    # Campos usados por el frontend / traza
+    price_eur = db.Column(db.Integer)
+    city = db.Column(db.String(120))
+    images = db.Column(db.Text)                       # guarda "img1.jpg,img2.jpg"
+    size_m2 = db.Column(db.Integer)
+    features = db.Column(db.Text)
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    # La traza mostraba "availableFrom" (respetamos el nombre tal cual)
+    availableFrom = db.Column(db.Date)
 
-def init_db():
-    with closing(db()) as conn, conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS rooms (
-          id TEXT PRIMARY KEY,
-          title TEXT,
-          price_eur INTEGER,
-          city TEXT,
-          size_m2 INTEGER,
-          features TEXT,
-          availableFrom TEXT,
-          images TEXT,
-          created_at TEXT,
-          updated_at TEXT
-        )
-        """)
-init_db()
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+    # Bloque cédula
+    cedula_status = db.Column(db.String(50))          # e.g. "pending/verified/rejected"
+    cedula_ref = db.Column(db.String(120))
+    cedula_expiry = db.Column(db.Date)
+    cedula_locked = db.Column(db.Boolean, default=False)
+    cedula_verification = db.Column(db.String(120))   # e.g. "auto/manual"
+    cedula_doc_url = db.Column(db.String(500))
+    cedula_doc_hash = db.Column(db.String(120))
+    cedula_issuer = db.Column(db.String(120))
+    cedula_issue_date = db.Column(db.Date)
+    cedula_last_check = db.Column(db.Date)
+    cedula_reason = db.Column(db.String(255))
 
-def center_crop_to_ratio(img: Image.Image, ratio: float = TARGET_RATIO) -> Image.Image:
-    w, h = img.size
-    current = w / h
-    if abs(current - ratio) < 1e-3:
-        return img
-    if current > ratio:
-        new_w = int(h * ratio)
-        left = (w - new_w) // 2
-        return img.crop((left, 0, left + new_w, h))
-    else:
-        new_h = int(w / ratio)
-        top = (h - new_h) // 2
-        return img.crop((0, top, w, top + new_h))
 
-def to_webp_bytes(img: Image.Image, quality: int = 82) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="WEBP", quality=quality, method=6)
-    return buf.getvalue()
+# --------- helper: serializar Room en JSON ----------
+def room_to_json(r: Room):
+    return {
+        "id": r.id,
+        "title": r.title,
+        "price_eur": r.price_eur or 0,
+        "city": r.city,
+        "images": [] if not r.images else r.images.split(","),  # texto -> lista
+        "size_m2": r.size_m2,
+        "features": r.features,
+        "availableFrom": r.availableFrom.isoformat() if r.availableFrom else None,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        "cedula": {
+            "status": r.cedula_status,
+            "ref": r.cedula_ref,
+            "expiry": r.cedula_expiry.isoformat() if r.cedula_expiry else None,
+            "locked": bool(r.cedula_locked),
+            "verification": r.cedula_verification,
+            "doc_url": r.cedula_doc_url,
+            "doc_hash": r.cedula_doc_hash,
+            "issuer": r.cedula_issuer,
+            "issue_date": r.cedula_issue_date.isoformat() if r.cedula_issue_date else None,
+            "last_check": r.cedula_last_check.isoformat() if r.cedula_last_check else None,
+            "reason": r.cedula_reason,
+        }
+    }
 
-def to_jpg_bytes(img: Image.Image, quality: int = 84) -> bytes:
-    buf = io.BytesIO()
-    img = img.convert("RGB")
-    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
-    return buf.getvalue()
 
-def tiny_placeholder(img: Image.Image, width: int = 20) -> str:
-    ph = ImageOps.fit(img, (width, int(width / TARGET_RATIO)), method=Image.LANCZOS)
-    b = io.BytesIO()
-    ph.save(b, format="JPEG", quality=30)
-    return "data:image/jpeg;base64," + base64.b64encode(b.getvalue()).decode("utf-8")
+# --------- control de roles (solo equipo SpainRoom puede editar cédula) ---------
+ALLOWED_EDITOR_ROLES = {"admin", "spainroom"}  # propietarios quedan fuera
 
-def process_image_file(file_storage, room_id: str) -> dict:
-    if not file_storage.filename or not allowed_file(file_storage.filename):
-        raise ValueError("invalid file type")
-    img = Image.open(file_storage.stream)
-    img = ImageOps.exif_transpose(img)
-    img = center_crop_to_ratio(img)
+def require_role(*roles):
+    roles_lc = {r.lower() for r in roles}
+    role = (request.headers.get("X-User-Role") or "").lower()
+    if role not in roles_lc:
+        return jsonify({"error": "No autorizado", "needed": sorted(list(roles_lc)), "got": role}), 403
 
-    base_name = f"{room_id}-{uuid.uuid4().hex}"
-    placeholder = tiny_placeholder(img)
 
-    out = {"url": None, "placeholder": placeholder, "srcset": {}}
-    for w in SIZES:
-        resized = ImageOps.contain(img, (w, int(w / TARGET_RATIO)), method=Image.LANCZOS)
-        webp_name = f"{base_name}-{w}.webp"
-        with open(os.path.join(UPLOAD_DIR, webp_name), "wb") as fh:
-            fh.write(to_webp_bytes(resized))
-        jpg_name = f"{base_name}-{w}.jpg"
-        with open(os.path.join(UPLOAD_DIR, jpg_name), "wb") as fh:
-            fh.write(to_jpg_bytes(resized))
-        out["srcset"][str(w)] = f"/uploads/{webp_name}"
-        if out["url"] is None:
-            out["url"] = f"/uploads/{webp_name}"
-    return out
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    db.init_app(app)
 
-@app.get("/uploads/<path:filename>")
-def uploads(filename: str):
-    return send_from_directory(UPLOAD_DIR, filename, conditional=True)
+    # CORS para /api/*  — Permite local y tu dominio Vercel (cámbialo por el real)
+    CORS(app, resources={
+        r"/api/*": {
+            "origins": [
+                "http://localhost:5173",
+                "https://TU-FRONTEND.vercel.app"
+            ]
+        }
+    })
 
-@app.post("/api/upload-room-photo")
-def upload_room_photo():
-    if "file" not in request.files:
-        return jsonify({"error": "file required"}), 400
-    room_id = request.form.get("room_id") or str(uuid.uuid4())
-    try:
-        img_obj = process_image_file(request.files["file"], room_id)
-        return jsonify(img_obj), 201
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    # ---- LOG de la URI y ping de DB al arrancar ----
+    print(">>> SQLALCHEMY_DATABASE_URI =", app.config.get("SQLALCHEMY_DATABASE_URI"))
+    with app.app_context():
+        try:
+            pong = db.session.execute(_text("SELECT 1")).scalar()
+            app.logger.info("DB PING -> %s", pong)
+        except Exception as e:
+            app.logger.error("DB PING FAILED: %s", e)
 
-def _is_under_uploads(path: str) -> bool:
-    abs_up = os.path.abspath(UPLOAD_DIR)
-    abs_p = os.path.abspath(path)
-    return abs_p.startswith(abs_up + os.sep)
+    @app.get("/")
+    def root():
+        return jsonify(ok=True, service="SpainRoom backend")
 
-def delete_image_variants(img_obj: dict):
-    urls = set()
-    if img_obj.get("url"):
-        urls.add(img_obj["url"])
-    for _k, u in (img_obj.get("srcset") or {}).items():
-        urls.add(u)
-    for u in urls:
-        filename = urlparse(u).path.split("/uploads/", 1)[1]
-        webp_path = os.path.join(UPLOAD_DIR, filename)
-        jpg_path = webp_path.rsplit(".", 1)[0] + ".jpg"
-        for path in (webp_path, jpg_path):
-            if _is_under_uploads(path) and os.path.exists(path):
-                os.remove(path)
+    # ---- Health DB ----
+    @app.get("/health/db")
+    def health_db():
+        try:
+            db.session.execute(_text("SELECT 1"))
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}, 500
 
-# CRUD Rooms (GET, POST, PUT, DELETE) ...
-# (el código sigue igual al que te pasé, completo)
+    # ---- Listado de habitaciones ----
+    @app.get("/api/rooms")
+    def list_rooms():
+        qs = Room.query.order_by(Room.created_at.desc()).all()
+        return jsonify([room_to_json(r) for r in qs])
+
+    # ---- Detalle de habitación por ID ----
+    @app.get("/api/rooms/<int:room_id>")
+    def get_room(room_id: int):
+        r = Room.query.get_or_404(room_id)
+        return jsonify(room_to_json(r))
+
+    # ---- Endpoints de cédula (con control de rol) ----
+    @app.post("/api/rooms/<int:room_id>/cedula")
+    def update_cedula(room_id: int):
+        # Solo admin/spainroom pueden modificar
+        unauthorized = require_role(*ALLOWED_EDITOR_ROLES)
+        if unauthorized:
+            return unauthorized
+
+        room = Room.query.get_or_404(room_id)
+        data = request.get_json(force=True, silent=True) or {}
+
+        mapping = {
+            "status": "cedula_status",
+            "ref": "cedula_ref",
+            "expiry": "cedula_expiry",
+            "locked": "cedula_locked",
+            "verification": "cedula_verification",
+            "doc_url": "cedula_doc_url",
+            "doc_hash": "cedula_doc_hash",
+            "issuer": "cedula_issuer",
+            "issue_date": "cedula_issue_date",
+            "reason": "cedula_reason",
+        }
+
+        for k_req, k_model in mapping.items():
+            if k_req in data:
+                val = data[k_req]
+                if k_model in ("cedula_expiry", "cedula_issue_date") and isinstance(val, str):
+                    try:
+                        val = datetime.strptime(val, "%Y-%m-%d").date()
+                    except ValueError:
+                        return jsonify(error=f"Formato de fecha inválido en {k_req} (YYYY-MM-DD)"), 400
+                setattr(room, k_model, val)
+
+        room.cedula_last_check = date.today()
+        db.session.commit()
+        return jsonify({"ok": True, "room_id": room.id})
+
+    @app.post("/api/rooms/<int:room_id>/cedula/verify")
+    def verify_cedula(room_id: int):
+        # Solo admin/spainroom pueden verificar
+        unauthorized = require_role(*ALLOWED_EDITOR_ROLES)
+        if unauthorized:
+            return unauthorized
+
+        room = Room.query.get_or_404(room_id)
+        if not room.cedula_doc_url:
+            return jsonify({"error": "No hay documento cargado"}), 400
+
+        room.cedula_status = "verified"
+        room.cedula_verification = room.cedula_verification or "auto"
+        room.cedula_last_check = date.today()
+        db.session.commit()
+
+        return jsonify({"ok": True, "doc_url": room.cedula_doc_url})
+
+    return app
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    print("Starting SpainRoom backend on http://127.0.0.1:5000 ...")
+    # Recuerda: define DATABASE_URL para Postgres o se usará SQLite (app.db)
+    app.run(host="127.0.0.1", port=5000, debug=True)
