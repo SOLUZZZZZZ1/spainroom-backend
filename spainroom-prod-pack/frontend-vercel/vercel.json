@@ -1,0 +1,1 @@
+{ "rewrites": [ { "source": "/api/cedula/:path*", "destination": "https://TU-BACKEND-HTTPS/api/cedula/:path*" } ] }
