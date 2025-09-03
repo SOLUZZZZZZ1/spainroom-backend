@@ -1,2 +1,16 @@
 Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
 Flask-Cors==4.0.1
+
+# Driver de base de datos
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.30
+
+# Utilidades
+python-dotenv==1.0.1
+
+# Servidor WSGI de producción
+gunicorn==21.2.0
+
+# Pagos
+stripe==5.8.0
