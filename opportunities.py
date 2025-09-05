@@ -1,120 +1,128 @@
 # opportunities.py
+# Blueprint de oportunidades/colaboraciones (franquiciados, propietarios, colaboradores)
+from __future__ import annotations
+
+import csv
 import os
-import re
-import smtplib
-from email.message import EmailMessage
-from flask import Blueprint, request, jsonify
+import time
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, List
 
-bp_opp = Blueprint("opportunities", __name__, url_prefix="/api/oportunidades")
+from flask import Blueprint, request, jsonify, current_app, abort
 
-EMAIL_TO = os.getenv("CONTACT_EMAIL_TO")  # destinatario (ej. soporte@spainroom.es)
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-SMTP_TLS  = os.getenv("SMTP_TLS", "true").lower() in ("1", "true", "yes")
+bp_opps = Blueprint("opportunities", __name__, url_prefix="/api/opportunities")
 
-def _is_email(v: str) -> bool:
-    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v or ""))
 
-def _normalize_bool(v):
-    if isinstance(v, bool): 
-        return v
-    if v is None: 
-        return False
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+@dataclass
+class Lead:
+    created_at: float
+    tipo: str             # 'franquiciado' | 'propietario' | 'colaborador'
+    nombre: str
+    email: str
+    telefono: Optional[str]
+    ciudad: Optional[str]
+    mensaje: Optional[str]
+    meta: Dict[str, Any]
 
-@bp_opp.post("/contacto")
-def contacto():
-    """
-    Espera JSON:
-    {
-      empresa: str, nombre: str, email: str, telefono: str, provincia: str,
-      interes: {captar: bool, portfolio: bool, inversion: bool, colaboraciones: bool},
-      mensaje: str, consentimiento: bool
-    }
-    """
-    data = request.get_json(silent=True) or {}
 
-    empresa  = (data.get("empresa") or "").strip()
-    nombre   = (data.get("nombre") or "").strip()
-    email    = (data.get("email") or "").strip()
-    telefono = (data.get("telefono") or "").strip()
-    provincia = (data.get("provincia") or "").strip()
-    interes  = data.get("interes") or {}
-    captar   = _normalize_bool(interes.get("captar"))
-    portfolio = _normalize_bool(interes.get("portfolio"))
-    inversion = _normalize_bool(interes.get("inversion"))
-    colaboraciones = _normalize_bool(interes.get("colaboraciones"))
-    mensaje  = (data.get("mensaje") or "").strip()
-    consentimiento = _normalize_bool(data.get("consentimiento"))
+def _storage_csv_path() -> str:
+    base = current_app.instance_path  # p.ej. backend/instance
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "opportunities.csv")
 
-    # Validación básica
-    if not empresa:
-        return jsonify(error="empresa requerida"), 400
-    if not nombre:
-        return jsonify(error="nombre requerido"), 400
-    if not _is_email(email):
-        return jsonify(error="email inválido"), 400
-    if not telefono:
-        return jsonify(error="teléfono requerido"), 400
-    if not consentimiento:
-        return jsonify(error="debes aceptar el tratamiento de datos"), 400
 
-    # Payload para email o almacenamiento futuro
-    payload = {
-        "empresa": empresa,
-        "nombre": nombre,
-        "email": email,
-        "telefono": telefono,
-        "provincia": provincia,
-        "interes": {
-            "captar": captar,
-            "portfolio": portfolio,
-            "inversion": inversion,
-            "colaboraciones": colaboraciones,
-        },
-        "mensaje": mensaje,
-        "origen": "oportunidades-web",
-    }
+def _append_csv(lead: Lead) -> None:
+    path = _storage_csv_path()
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["created_at", "tipo", "nombre", "email", "telefono", "ciudad", "mensaje", "meta"],
+        )
+        if not exists:
+            writer.writeheader()
+        row = asdict(lead)
+        # Guarda meta como string (json-like)
+        row["meta"] = str(row["meta"])
+        writer.writerow(row)
 
-    # Enviar correo si SMTP configurado
-    sent = False
-    smtp_error = None
-    if EMAIL_TO and SMTP_HOST and SMTP_USER and SMTP_PASS:
+
+def _validate_payload(payload: Dict[str, Any]) -> Lead:
+    tipo = str(payload.get("tipo", "")).strip().lower()
+    if tipo not in {"franquiciado", "propietario", "colaborador"}:
+        abort(400, description="tipo debe ser franquiciado | propietario | colaborador")
+
+    nombre = str(payload.get("nombre", "")).strip()
+    email = str(payload.get("email", "")).strip()
+    telefono = str(payload.get("telefono", "")).strip() or None
+    ciudad = str(payload.get("ciudad", "")).strip() or None
+    mensaje = str(payload.get("mensaje", "")).strip() or None
+
+    if not nombre or not email:
+        abort(400, description="nombre y email son obligatorios")
+
+    # Campos adicionales libres
+    meta = payload.get("meta") or {}
+    if not isinstance(meta, dict):
+        meta = {"_raw_meta": str(meta)}
+
+    return Lead(
+        created_at=time.time(),
+        tipo=tipo,
+        nombre=nombre,
+        email=email,
+        telefono=telefono,
+        ciudad=ciudad,
+        mensaje=mensaje,
+        meta=meta,
+    )
+
+
+@bp_opps.get("/ping")
+def ping():
+    return jsonify({"ok": True, "opportunities": "alive"})
+
+
+@bp_opps.post("/leads")
+def create_lead():
+    payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    lead = _validate_payload(payload)
+    _append_csv(lead)
+
+    # (Opcional) enviar webhook a Slack/Discord si defines env
+    webhook = os.getenv("OPPORTUNITIES_WEBHOOK_URL")
+    if webhook:
         try:
-            msg = EmailMessage()
-            msg["Subject"] = f"[SpainRoom] Oportunidades — {empresa} / {nombre}"
-            msg["From"] = SMTP_USER
-            msg["To"] = EMAIL_TO
-            body = (
-                "Nueva solicitud de Oportunidades (web)\n\n"
-                f"Empresa: {empresa}\n"
-                f"Nombre: {nombre}\n"
-                f"Email: {email}\n"
-                f"Teléfono: {telefono}\n"
-                f"Provincia: {provincia}\n"
-                f"Interés:\n"
-                f"  - Captar habitaciones: {captar}\n"
-                f"  - Compartir portfolio: {portfolio}\n"
-                f"  - Inversión: {inversion}\n"
-                f"  - Colaboraciones: {colaboraciones}\n"
-                f"\nMensaje:\n{mensaje}\n"
+            import requests  # solo cuando se usa
+            requests.post(
+                webhook,
+                json={
+                    "text": f"Nuevo lead ({lead.tipo}) — {lead.nombre} <{lead.email}> — {lead.telefono or '-'} — {lead.ciudad or '-'}"
+                },
+                timeout=5,
             )
-            msg.set_content(body)
+        except Exception:
+            # No rompemos el flujo si el webhook falla
+            pass
 
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
-            if SMTP_TLS:
-                server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-            server.quit()
-            sent = True
-        except Exception as e:
-            smtp_error = str(e)
+    return jsonify({"ok": True, "stored": True})
 
-    result = {"ok": True, "notified": sent, "data": payload}
-    if smtp_error:
-        result["warning"] = f"email_not_sent: {smtp_error}"
 
-    return jsonify(result), 200
+@bp_opps.get("/admin/leads")
+def list_leads_admin():
+    # Protección mínima por cabecera
+    role = (request.headers.get("X-User-Role") or "").lower()
+    if role not in {"spainroom", "admin"}:
+        abort(403, description="forbidden")
+
+    path = _storage_csv_path()
+    if not os.path.exists(path):
+        return jsonify({"ok": True, "items": [], "count": 0})
+
+    items: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            items.append(row)
+
+    return jsonify({"ok": True, "items": items, "count": len(items)})
