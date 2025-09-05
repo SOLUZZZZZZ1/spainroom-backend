@@ -1,3 +1,9 @@
+# --- BEGIN: Fix sys.path for local modules ---
+import os, sys
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+# --- END ---
 # -*- coding: utf-8 -*-
 import os
 from datetime import datetime
