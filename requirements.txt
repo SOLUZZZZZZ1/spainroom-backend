@@ -1,27 +1,24 @@
-# Core
+# SpainRoom Backend (Render / Python)
+# Frameworks y servidor
+fastapi==0.111.0
 Flask==3.0.3
-Flask-SQLAlchemy==3.1.1
+uvicorn[standard]==0.30.6
+gunicorn==22.0.0
+websockets==12.0
 Flask-Cors==4.0.1
 
-# Base de datos (si usas Postgres en el futuro)
-psycopg2-binary==2.9.9
+# Base de datos
 SQLAlchemy==2.0.30
+Flask-SQLAlchemy==3.1.1
+psycopg2-binary==2.9.9
 
-# Utilidades
-python-dotenv==1.0.1
-
-# WSGI server
-gunicorn==22.0.0
-
-# Pagos (Stripe)
-stripe==7.14.0
-
-# Seguridad / defensa
+# Seguridad y utilidades
 flask-limiter==3.7.0
 PyJWT==2.10.1
-
-# Bot de voz (Twilio)
-twilio==9.2.3
-
-# HTTP requests
+python-dotenv==1.0.1
 requests==2.32.3
+
+# Integraciones
+twilio==9.2.3
+stripe==7.14.0
+openai==1.107.1
