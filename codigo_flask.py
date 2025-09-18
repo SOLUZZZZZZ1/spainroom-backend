@@ -2,7 +2,7 @@
 # Start: uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, re, time, contextlib, hashlib
-from typing import Dict, Any  # <-- IMPORTANTE: antes de usar Dict/Any
+from typing import Dict, Any
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response, JSONResponse, HTMLResponse
 from xml.sax.saxutils import quoteattr
@@ -98,10 +98,10 @@ async def answer_cr(request: Request):
 
 @app.api_route("/voice/fallback", methods=["GET", "POST"])
 async def voice_fallback(request: Request):
-    # Fallback idéntico: también inicia ConversationRelay (no <Say>)
+    # Fallback idéntico: ConversationRelay
     return await answer_cr(request)
 
-# === Conocimiento ============================================================
+# === Conocimiento y utilidades de intención =================================
 
 KNOWLEDGE: Dict[str, Dict[str, Any]] = {
     "que_hace": {
@@ -139,8 +139,8 @@ KNOWLEDGE: Dict[str, Dict[str, Any]] = {
             "Propietarios y franquiciados reciben sus pagos según la política acordada.",
         ],
     },
-    # Evitamos colisión con 'propietario'
     "propietarios": {
+        # Patrones más explícitos para no chocar con 'propietario'
         "patterns": ["info propietarios", "informacion propietarios", "para propietarios"],
         "answers": [
             "Para propietarios: publicamos, filtramos inquilinos, hacemos contrato y cobramos.",
@@ -164,17 +164,14 @@ KNOWLEDGE: Dict[str, Dict[str, Any]] = {
 }
 
 def _role_owner(tl: str) -> bool:
-    # “propietario/a/os/as”, “dueño/a/os/as” con límites de palabra
     return bool(re.search(r"\bpropiet(ario|aria|arios|arias)?\b|\bdueñ[oa]s?\b", tl))
 
 def _role_tenant(tl: str) -> bool:
     return bool(re.search(r"\binquil(in|ino|ina|inos|inas)?\b|\balquil(ar|o|a|as|amos|an)?\b", tl))
 
 def _match_topic(tl: str, step: str):
-    # Nunca activar conocimiento mientras estamos en el flujo principal
     if step in ("role", "city", "zone", "name", "phone"):
         return None
-    # Ignorar si contiene claro 'propietario'/'inquilino'
     if _role_owner(tl) or _role_tenant(tl):
         return None
     for k, cfg in KNOWLEDGE.items():
@@ -185,7 +182,6 @@ def _match_topic(tl: str, step: str):
 
 def _is_yes_help(tl: str) -> bool:
     tl = tl.lower()
-    # Palabras claras; evitamos 'si' para no colisionar
     yes_words = [" ayuda ", " asesor ", " llamar ", " llamada ", " contacto ", " por favor "]
     s = f" {tl} "
     return any(w in s for w in yes_words)
@@ -206,10 +202,10 @@ async def conversation_relay(ws: WebSocket):
         "info_hits": {k: 0 for k in KNOWLEDGE.keys()},
     }
 
-    # ARRANQUE INMEDIATO (pregunta una sola vez)
+    # ARRANQUE INMEDIATO — marcar como ya preguntado para evitar duplicados
     now_ms = time.monotonic() * 1000.0
     session["step"] = "role"
-    session["last_q"] = "role"       # evita que 'setup' re-pregunte
+    session["last_q"] = "role"
     session["last_q_ts"] = now_ms
     await ws.send_json({
         "type": "text",
@@ -325,4 +321,96 @@ async def conversation_relay(ws: WebSocket):
 
         elif s == "city":
             if len(tl) >= 2:
-                lead["
+                lead["poblacion"] = t.title()
+                session["step"] = "zone"
+                await ask_once("zone")
+                return
+            await ask_once("city")
+            return
+
+        elif s == "zone":
+            if len(tl) >= 2:
+                lead["zona"] = t.title()
+                session["step"] = "name"
+                await ask_once("name")
+                return
+            await ask_once("zone")
+            return
+
+        elif s == "name":
+            if len(t.split()) >= 2:
+                lead["nombre"] = t
+                session["step"] = "phone"
+                await ask_once("phone")
+                return
+            await speak("¿Su nombre completo, por favor?")
+            return
+
+        elif s == "phone":
+            d = _digits(t)
+            if d.startswith("34") and len(d) >= 11:
+                d = d[-9:]
+            if len(d) == 9 and d[0] in "6789":
+                lead["telefono"] = d
+                await finish()
+                return
+            await speak("¿Me facilita un teléfono de nueve dígitos?")
+            return
+
+        elif s == "post":
+            await speak("¿Quiere que le llame un asesor? Si es así, dígame 'ayuda'.")
+            return
+
+        elif s == "await_setup":
+            session["step"] = "role"
+            await ask_once("role")
+            return
+
+        # Conocimiento SOLO fuera del flujo principal
+        topic = _match_topic(tl, s)
+        if topic:
+            await answer_topic(topic)
+            if session["step"] != "await_setup":
+                await ask_once(session["step"])
+            return
+
+        await ask_once(session["step"])
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            tp = msg.get("type")
+            if tp == "setup":
+                # No re-preguntar si ya la hicimos al arrancar
+                if session.get("last_q") != "role":
+                    session["step"] = "role"
+                    await ask_once("role")
+            elif tp == "prompt":
+                txt = msg.get("voicePrompt", "") or ""
+                if msg.get("last", True) and txt:
+                    await handle_text(txt)
+            elif tp == "interrupt":
+                await ask_once(session["step"])
+            elif tp == "dtmf":
+                pass
+            elif tp == "error":
+                await speak("Disculpe. Estamos teniendo problemas. Inténtelo más tarde.", interruptible=False)
+                break
+    except Exception as e:
+        print("CR ws error:", e, flush=True)
+    finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+@app.post("/assign")
+async def assign(payload: dict):
+    zone_key = f"{(payload.get('poblacion') or '').strip().lower()}-{(payload.get('zona') or '').strip().lower()}"
+    fid = hashlib.sha1(zone_key.encode("utf-8")).hexdigest()[:10]
+    task = {
+        "title": "Contactar lead",
+        "zone_key": zone_key,
+        "franchisee_id": fid,
+        "lead": payload,
+        "created_at": int(time.time()),
+    }
+    return JSONResponse({"ok": True, "task": task})
