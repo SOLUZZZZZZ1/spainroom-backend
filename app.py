@@ -30,6 +30,45 @@ SQLALCHEMY_DATABASE_URI = f"sqlite:///{DB_PATH}"
 
 db = SQLAlchemy()
 
+# --- helper para cargar módulos locales por ruta cuando no hay paquete ---
+import importlib.util as _importlib_util
+
+def _load_local_module(_name: str, _path: str):
+    """Carga un .py concreto por ruta, evitando colisiones de nombre."""
+    _path = str(_path)
+    if not os.path.exists(_path):
+        raise FileNotFoundError(_path)
+    _spec = _importlib_util.spec_from_file_location(f"_fr_{_name}", _path)
+    _mod = _importlib_util.module_from_spec(_spec)
+    assert _spec and _spec.loader
+    _spec.loader.exec_module(_mod)
+    return _mod
+# --- construir un "paquete" franquicia a partir de los .py sueltos en raíz ---
+import types as _types
+
+def _build_franquicia_pkg_from_root():
+    """
+    Crea un paquete virtual 'franquicia' para que `routes.py` pueda hacer
+    imports relativos como `from .services import ...` aunque no exista carpeta.
+    """
+    # Crear módulo-paquete vacío
+    pkg = _types.ModuleType("franquicia")
+    pkg.__path__ = [str(BASE_DIR)]  # para que lo trate como paquete
+    sys.modules["franquicia"] = pkg
+
+    # Cargar submódulos desde archivos sueltos
+    models_mod = _load_local_module("franquicia.models", BASE_DIR / "models.py")
+    services_mod = _load_local_module("franquicia.services", BASE_DIR / "services.py")
+    routes_mod = _load_local_module("franquicia.routes", BASE_DIR / "routes.py")
+
+    # Registrar en sys.modules con nombres "franquicia.*" para resolver imports relativos
+    sys.modules["franquicia.models"] = models_mod
+    sys.modules["franquicia.services"] = services_mod
+    sys.modules["franquicia.routes"] = routes_mod
+
+    return routes_mod
+
+
 
 def create_app():
     app = Flask(__name__, instance_path=str(INSTANCE_DIR))
@@ -58,7 +97,7 @@ def create_app():
     )
 
     # =========================
-    # Defensa activa (cañones)
+    # Defensa activa (opcional)
     # =========================
     try:
         from defense import init_defense
@@ -71,6 +110,24 @@ def create_app():
     # Inicializa DB
     # =========================
     db.init_app(app)
+
+    # Importar modelos de Franquicia si el flag está activo (para que create_all cree tablas)
+    try:
+        if os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on":
+            try:
+                # Preferencia: paquete franquicia/
+                from franquicia import models as _fr_models  # noqa: F401
+                print("[FRANQ] Modelos de Franquicia importados (paquete).")
+            except Exception:
+                # Fallback: ficheros sueltos en RAÍZ (models.py)
+                _models_path = BASE_DIR / "models.py"
+                _fr_models = _load_local_module("models", _models_path)  # noqa: F401
+                print("[FRANQ] Modelos de Franquicia importados (raíz).")
+        else:
+            print("[FRANQ] Flag OFF: no se importan modelos de Franquicia.")
+    except Exception as e:
+        print("[WARN] No se pudieron importar modelos de Franquicia:", e)
+
     with app.app_context():
         try:
             db.create_all()
@@ -78,13 +135,16 @@ def create_app():
             print("[DB] Aviso: create_all falló (no crítico):", e)
 
     # =========================
-    # Blueprints opcionales
+    # Blueprints opcionales existentes
     # =========================
 
     # Auth (sin dependencia de SQLAlchemy)
     try:
         from auth import bp_auth, register_auth_models
-        register_auth_models(db)  # es no-op en nuestra versión
+        try:
+            register_auth_models(db)  # es no-op en algunas versiones
+        except Exception as e:
+            print("[WARN] register_auth_models falló (no crítico):", e)
         app.register_blueprint(bp_auth)
         print("[AUTH] Blueprint auth registrado.")
     except Exception as e:
@@ -94,7 +154,7 @@ def create_app():
     try:
         from payments import bp_pay
         if not os.getenv("STRIPE_SECRET_KEY"):
-            raise RuntimeError("'STRIPE_SECRET_KEY'")
+            raise RuntimeError("'STRIPE_SECRET_KEY' no configurada")
         app.register_blueprint(bp_pay)
         print("[PAY] Blueprint payments registrado.")
     except Exception as e:
@@ -111,10 +171,33 @@ def create_app():
     # Voice bot (Twilio) — opcional
     try:
         from voice_bot import bp_voice
-        app.register_blueprint(bp_voice)
+        app.register_blueprint(bp_voice, url_prefix="/voice")
         print("[VOICE] Blueprint voice registrado.")
     except Exception as e:
         print("[WARN] Voice module not loaded:", e)
+
+    # =========================
+    # Franquicia (INTERNAL Admin) detrás de feature flag
+    # =========================
+    try:
+        if os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on":
+            try:
+                # Preferencia: paquete franquicia/
+                from franquicia.routes import bp_franquicia
+                print("[FRANQ] Blueprint (paquete) localizado.")
+            except Exception:
+                # Fallback: fichero suelto en RAÍZ (routes.py) con bp_franquicia
+                _routes_path = BASE_DIR / "routes.py"
+                _fr_routes = _load_local_module("routes", _routes_path)
+                bp_franquicia = getattr(_fr_routes, "bp_franquicia")
+                print("[FRANQ] Blueprint (raíz) localizado.")
+
+            app.register_blueprint(bp_franquicia, url_prefix="/api/admin/franquicia")
+            print("[FRANQ] Blueprint Franquicia (interno) registrado.")
+        else:
+            print("[FRANQ] Flag OFF: módulo Franquicia no registrado (seguro por defecto).")
+    except Exception as e:
+        print("[WARN] Franquicia module not loaded:", e)
 
     # =========================
     # Rutas base
@@ -127,7 +210,6 @@ def create_app():
     # Demo Rooms (en memoria)
     @app.get("/api/rooms")
     def list_rooms():
-        # Demostración simple (cuando no está la tabla persistente)
         rooms = [
             {
                 "id": 1,
@@ -164,7 +246,6 @@ def create_app():
         if f.filename == "":
             return jsonify(error="Archivo inválido"), 400
 
-        # Nombre seguro
         filename = secure_filename(f.filename)
         ts = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
         name, ext = os.path.splitext(filename)
