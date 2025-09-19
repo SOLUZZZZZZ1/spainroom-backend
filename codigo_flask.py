@@ -39,8 +39,8 @@ def _twiml_cr():
         'interruptible="speech"',
         'reportInputDuringAgentSpeech="none"',
     ]
+    # Si dejas welcome vacío, NO se incluye (evita doble pregunta)
     if welcome:
-        # Si no quieres “doble pregunta”, deja CR_WELCOME vacío (la primera pregunta la hará el WS)
         attrs.append(f'welcomeGreeting="{welcome}"')
     if voice:
         attrs.append(f'voice="{voice}"')
@@ -75,7 +75,7 @@ def create_app():
 
     @app.api_route("/voice/fallback", methods=["GET","POST"])
     def voice_fallback():
-        # Fallback idéntico (ConversationRelay). No usamos <Say> para evitar la locución de “lo siento”.
+        # Fallback idéntico (ConversationRelay). No usamos <Say>
         return Response(_twiml_cr(), mimetype="application/xml")
 
     # -------------------- Stripe Webhook (firmado) --------------------
