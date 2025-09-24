@@ -1,144 +1,109 @@
-# app.py
-"""
-SpainRoom BACKEND (API)
-Flask + SQLAlchemy + CORS + logging + health.
+# SpainRoom — Flask VOZ + Stripe (TwiML + Webhook firmado)
+# Render:
+#   Build: pip install -r requirements.txt
+#   Start: gunicorn "app:create_app()"
+#
+# Env requeridas (Render → Environment):
+#   VOICE_WS_URL=wss://spainroom-backend-1.onrender.com/cr
+#   CR_LANGUAGE=es-ES
+#   CR_TRANSCRIPTION_LANGUAGE=es-ES
+#   CR_TTS_PROVIDER=Google
+#   CR_VOICE=es-ES-Standard-A
+#   CR_WELCOME=Bienvenido a SpainRoom
+#   STRIPE_WEBHOOK_SECRET=whsec_*******
 
-Blueprints:
-  /api/auth/*        -> routes_auth.bp_auth
-  /api/contacto/*    -> routes_contact.bp_contact
-  /api/contracts/*   -> routes_contracts.bp_contracts
-  /api/rooms/*       -> routes_rooms.bp_rooms
-  /api/rooms/*       -> routes_uploads_rooms.bp_upload_rooms
-  /api/upload        -> routes_upload_generic.bp_upload_generic
-  /api/franchise/*   -> routes_franchise.bp_franchise
-  /api/kyc/*         -> routes_kyc.bp_kyc
-  /api/payments/*    -> payments.bp_payments
-  /sms/*             -> routes_sms.bp_sms
-"""
-import os, sys, types, logging
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from flask import Flask, jsonify, request
+import os
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
-# DB robusto
-try:
-    from extensions import db
-except Exception:
-    from flask_sqlalchemy import SQLAlchemy
-    db = SQLAlchemy()
-    mod = types.ModuleType("extensions"); mod.db = db; sys.modules["extensions"] = mod
+def env(k, default=""):
+    return os.getenv(k, default)
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB = f"sqlite:///{(BASE_DIR / 'spainroom.db').as_posix()}"
-SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", DEFAULT_DB)
-JWT_SECRET  = os.environ.get("JWT_SECRET", os.environ.get("SECRET_KEY", "sr-dev-secret"))
-JWT_TTL_MIN = int(os.environ.get("JWT_TTL_MIN", "720"))
+def _twiml_cr():
+    """Construye TwiML <ConversationRelay> apuntando al WS del servicio VOZ."""
+    ws_url     = env("VOICE_WS_URL", "").strip() or "wss://INVALID-WS-URL"
+    lang       = env("CR_LANGUAGE", "es-ES").strip()
+    trans_lang = env("CR_TRANSCRIPTION_LANGUAGE", lang).strip()
+    tts        = env("CR_TTS_PROVIDER", "Google").strip()
+    voice      = env("CR_VOICE", "").strip()
+    welcome    = env("CR_WELCOME", "").strip()
 
-def create_app(test_config=None):
-    app = Flask(__name__, static_folder="public", static_url_path="/")
-    try:
-        Path(app.instance_path).mkdir(parents=True, exist_ok=True)
-        Path(app.instance_path, "uploads").mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    attrs = [
+        f'url="{ws_url}"',
+        f'language="{lang}"',
+        f'transcriptionLanguage="{trans_lang}"',
+        f'ttsProvider="{tts}"',
+        'interruptible="speech"',
+        'reportInputDuringAgentSpeech="none"',
+    ]
+    if welcome:
+        attrs.append(f'welcomeGreeting="{welcome}"')
+    if voice:
+        attrs.append(f'voice="{voice}"')
 
-    app.config.update(
-        SQLALCHEMY_DATABASE_URI=SQLALCHEMY_DATABASE_URI,
-        SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        JWT_SECRET=JWT_SECRET,
-        JWT_TTL_MIN=JWT_TTL_MIN,
-    )
-    if test_config:
-        app.config.update(test_config)
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <ConversationRelay {' '.join(attrs)} />
+  </Connect>
+</Response>'''
 
-    db.init_app(app)
+def create_app():
+    app = Flask(__name__)
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-    _init_logging(app)
 
-    # Importar modelos y rutas ANTES de create_all
-    from routes_auth import bp_auth; import models_auth
-    from routes_contact import bp_contact; import models_contact
-    from routes_contracts import bp_contracts; import models_contracts
-    from routes_rooms import bp_rooms; import models_rooms; import models_roomleads
-    from routes_uploads_rooms import bp_upload_rooms; import models_uploads
-    from routes_upload_generic import bp_upload_generic
-    from routes_franchise import bp_franchise; import models_franchise
-    from routes_kyc import bp_kyc
-    from routes_sms import bp_sms
-    from payments import bp_payments  # << pagos/Stripe
-
-    # create_all
-    with app.app_context():
-        try:
-            import models_kyc  # si existe, crea tabla; si no, sigue
-        except Exception:
-            pass
-        db.create_all()
-        app.logger.info("DB create_all() OK")
-
-    # Registrar blueprints
-    app.register_blueprint(bp_auth, url_prefix="/api/auth")
-    app.register_blueprint(bp_contact)
-    app.register_blueprint(bp_contracts)
-    app.register_blueprint(bp_rooms)
-    app.register_blueprint(bp_upload_rooms)
-    app.register_blueprint(bp_upload_generic)
-    app.register_blueprint(bp_franchise)
-    app.register_blueprint(bp_kyc)
-    app.register_blueprint(bp_payments, url_prefix="/api/payments")
-    app.register_blueprint(bp_sms)
-
-    # CORS global
-    ALLOWED_ORIGINS = {
-        "http://localhost:5176",
-        "http://127.0.0.1:5176",
-        # añade Vercel si lo usas:
-        # "https://tu-frontend.vercel.app",
-    }
-    @app.after_request
-    def add_cors_headers(resp):
-        origin = request.headers.get("Origin")
-        if origin and (origin in ALLOWED_ORIGINS or origin.endswith(".vercel.app")):
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Vary"] = "Origin"
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, X-Franquiciado"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-        return resp
-
-    # Salud y errores
+    # -------------------- Health & Diag --------------------
     @app.get("/health")
-    def health(): return jsonify(ok=True, service="spainroom-backend")
+    def health():
+        return jsonify(ok=True, service="flask-voz-stripe")
 
-    @app.get("/")
-    def index(): return jsonify(ok=True, msg="SpainRoom API")
+    @app.get("/diag_runtime")
+    def diag_runtime():
+        keys = ["VOICE_WS_URL","CR_LANGUAGE","CR_TRANSCRIPTION_LANGUAGE",
+                "CR_TTS_PROVIDER","CR_VOICE","CR_WELCOME"]
+        return jsonify({k: env(k, "") for k in keys})
 
-    @app.errorhandler(404)
-    def nf(e): return jsonify(ok=False, error="not_found", message="No encontrado"), 404
+    # -------------------- TwiML --------------------
+    @app.route("/voice/answer_cr", methods=["GET","POST"])
+    def voice_answer():
+        return Response(_twiml_cr(), mimetype="application/xml")
 
-    @app.errorhandler(500)
-    def se(e):
-        app.logger.exception("500"); return jsonify(ok=False, error="server_error"), 500
+    @app.route("/voice/fallback", methods=["GET","POST"])
+    def voice_fallback():
+        return Response(_twiml_cr(), mimetype="application/xml")
+
+    # -------------------- Stripe Webhook --------------------
+    @app.route("/webhooks/stripe", methods=["POST"])
+    def stripe_webhook():
+        secret = env("STRIPE_WEBHOOK_SECRET", "")
+        if not secret:
+            return jsonify(ok=False, error="missing_webhook_secret"), 500
+
+        try:
+            import stripe
+        except Exception:
+            return jsonify(ok=False, error="stripe_sdk_not_installed"), 500
+
+        payload = request.get_data(cache=False, as_text=False)
+        sig_hdr = request.headers.get("Stripe-Signature", "")
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload,
+                sig_header=sig_hdr,
+                secret=secret
+            )
+        except Exception as e:
+            return jsonify(ok=False, error="invalid_signature", message=str(e)), 400
+
+        ev_type = event.get("type", "")
+        ev_id   = event.get("id", "")
+        app.logger.info("Stripe event: %s id=%s", ev_type, ev_id)
+
+        return jsonify(ok=True)
 
     return app
 
-def _init_logging(app):
-    app.logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
-    app.logger.addHandler(sh)
-    logs_dir = BASE_DIR / "logs"; logs_dir.mkdir(exist_ok=True)
-    fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt); fh.setLevel(logging.INFO); app.logger.addHandler(fh)
-    app.logger.info("Logging listo")
-
-def run_dev():
-    app = create_app()
-    debug = os.environ.get("FLASK_DEBUG", "1") in ("1","true","True")
-    port = int(os.environ.get("PORT", "5000"))
-    app.logger.info("Dev http://127.0.0.1:%s (debug=%s)", port, debug)
-    app.run(host="0.0.0.0", port=port, debug=debug)
-
 if __name__ == "__main__":
-    run_dev()
+    app = create_app()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5005")), debug=True)
