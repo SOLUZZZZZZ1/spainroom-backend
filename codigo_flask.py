@@ -1,76 +1,117 @@
-# codigo_flask.py — VOZ (Flask) + TwiML
+# codigo_flask.py — SpainRoom util + pagos (CORS + demo Stripe fallback)
 import os
-from flask import Flask, request, jsonify, Response
+from math import radians, sin, cos, sqrt, atan2
+from urllib.parse import urljoin
+
+import requests
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-def env(k, d=""): return os.getenv(k, d)
+# =========================================
+# App & CORS
+# =========================================
+app = Flask(__name__)
 
-def _twiml_cr():
-    ws_url     = env("VOICE_WS_URL", "").strip() or "wss://INVALID-WS-URL"
-    lang       = env("CR_LANGUAGE", "es-ES").strip()
-    trans_lang = env("CR_TRANSCRIPTION_LANGUAGE", lang).strip()
-    tts        = env("CR_TTS_PROVIDER", "Google").strip()
-    voice      = env("CR_VOICE", "").strip()
-    welcome    = env("CR_WELCOME", "").strip()
+# Orígenes permitidos para desarrollo y prod (ajusta tu dominio final de front si lo tienes)
+ALLOWED_ORIGINS = [
+    "http://localhost:5176",
+    "http://127.0.0.1:5176",
+    # añade tu dominio de frontend público si lo tienes, ej.:
+    # "https://spainroom-frontend.vercel.app",
+]
 
-    attrs = [
-        f'url="{ws_url}"',
-        f'language="{lang}"',
-        f'transcriptionLanguage="{trans_lang}"',
-        f'ttsProvider="{tts}"',
-        'interruptible="speech"',
-        'reportInputDuringAgentSpeech="none"'
+CORS(app, resources={
+    r"/api/*": {"origins": ALLOWED_ORIGINS, "methods": ["GET", "POST", "OPTIONS"]},
+    r"/create-checkout-session": {"origins": ALLOWED_ORIGINS, "methods": ["POST", "OPTIONS"]},
+    r"/healthz": {"origins": "*"}
+})
+
+# =========================================
+# Utilidades
+# =========================================
+def calcular_distancia(lat1, lon1, lat2, lon2):
+    """Distancia Haversine en km."""
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    c = 2*atan2(sqrt(a), sqrt(1-a))
+    return R*c
+
+def _abs_url(origin: str, path: str) -> str:
+    """Construye URL absoluta para success/cancel si nos pasan un path relativo."""
+    if not path:
+        return origin or ""
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    # path relativo → origin/path
+    return urljoin(origin.rstrip("/") + "/", path.lstrip("/"))
+
+# =========================================
+# Health
+# =========================================
+@app.get("/healthz")
+def healthz():
+    return jsonify(ok=True), 200
+
+# =========================================
+# 1) Geocodificación (Nominatim)
+# =========================================
+@app.get("/api/geocode")
+def geocode():
+    address = request.args.get("address")
+    if not address:
+        return jsonify({"error": "Falta parámetro address"}), 400
+
+    url = "https://nominatim.openstreetmap.org/search"
+    headers = {"User-Agent": "SpainRoom/1.0"}
+    r = requests.get(url, params={"q": address, "format": "json", "limit": 1}, headers=headers, timeout=15)
+
+    if r.status_code != 200 or not r.json():
+        return jsonify({"error": "No se pudo geocodificar"}), 500
+
+    data = r.json()[0]
+    return jsonify({"lat": float(data["lat"]), "lng": float(data["lon"])})
+
+# =========================================
+# 2) Búsqueda de empleos (mock con distancia real)
+# =========================================
+@app.get("/api/jobs/search")
+def search_jobs():
+    try:
+        lat = float(request.args.get("lat"))
+        lng = float(request.args.get("lng"))
+        radius = float(request.args.get("radius_km", 2))
+        keyword = (request.args.get("q") or "").lower()
+    except Exception:
+        return jsonify({"error": "Parámetros inválidos"}), 400
+
+    # Base ficticia (coordenadas alrededor de lat/lng)
+    ofertas = [
+        {"id": 1, "titulo": "Camarero/a",     "empresa": "Bar Central",     "lat": lat + 0.010, "lng": lng + 0.010},
+        {"id": 2, "titulo": "Dependiente/a",  "empresa": "Tienda Local",    "lat": lat + 0.015, "lng": lng + 0.000},
+        {"id": 3, "titulo": "Administrativo/a","empresa": "Gestoría",       "lat": lat - 0.020, "lng": lng - 0.010},
+        {"id": 4, "titulo": "Carpintero/a",   "empresa": "Taller Madera",   "lat": lat + 0.030, "lng": lng + 0.020},
     ]
-    if welcome: attrs.append(f'welcomeGreeting="{welcome}"')
-    if voice:   attrs.append(f'voice="{voice}"')
 
-    return f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <ConversationRelay {' '.join(attrs)} />
-  </Connect>
-</Response>'''
+    resultados = []
+    for o in ofertas:
+        dist = calcular_distancia(lat, lng, o["lat"], o["lng"])
+        if dist <= radius:
+            if not keyword or keyword in o["titulo"].lower():
+                resultados.append({
+                    "id": o["id"],
+                    "titulo": o["titulo"],
+                    "empresa": o["empresa"],
+                    "distancia_km": round(dist, 2)
+                })
 
-def create_app():
-    app = Flask(__name__)
-    CORS(app, resources={r"/*": {"origins": ["*"]}}, supports_credentials=True)
+    return jsonify(resultados)
 
-    @app.get("/health")
-    def health(): 
-        return jsonify(ok=True)
-
-    @app.get("/diag_runtime")
-    def diag(): 
-        keys = ["VOICE_WS_URL","CR_LANGUAGE","CR_TRANSCRIPTION_LANGUAGE","CR_TTS_PROVIDER","CR_VOICE","CR_WELCOME"]
-        return jsonify({k: env(k, "") for k in keys})
-
-    @app.route("/voice/answer_cr", methods=["GET","POST"])
-    def voice_answer(): 
-        return Response(_twiml_cr(), mimetype="application/xml")
-
-    @app.route("/voice/fallback", methods=["GET","POST"])
-    def voice_fallback(): 
-        return Response(_twiml_cr(), mimetype="application/xml")
-
-    @app.post("/webhooks/stripe")
-    def stripe_webhook():
-        secret = env("STRIPE_WEBHOOK_SECRET", "")
-        if not secret: return jsonify(ok=False, error="missing_webhook_secret"), 500
-        try: import stripe
-        except Exception: return jsonify(ok=False, error="stripe_sdk_not_installed"), 500
-
-        payload = request.get_data(cache=False, as_text=False)
-        sig_hdr = request.headers.get("Stripe-Signature", "")
-        try:
-            event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_hdr, secret=secret)
-        except Exception as e:
-            return jsonify(ok=False, error="invalid_signature", message=str(e)), 400
-
-        app.logger.info("Stripe event: %s id=%s", event.get("type",""), event.get("id",""))
-        return jsonify(ok=True)
-
-    return app
-
-if __name__ == "__main__":
-    app = create_app()
-    app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5005")), debug=True)
+# =========================================
+# 3) Pagos — /create-checkout-session
+#    - Si STRIPE_SECRET_KEY no está → DEMO (redirige al success)
+#    - Si está → crea sesión de Stripe y devuelve URL de Checkout
+# =========================================
+@app.post("/create-checkout-session")
+def create_checkout
