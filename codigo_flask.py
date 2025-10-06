@@ -177,6 +177,12 @@ def create_checkout_session():
 # =========================================
 # Arranque (Render usa PORT)
 # =========================================
+# ✅ Factory para Gunicorn/Render
+def create_app():
+    # La app ya está configurada arriba (CORS, rutas, etc.)
+    return app
+
 if __name__ == "__main__":
-  port = int(os.environ.get("PORT", "10000"))
-  app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
