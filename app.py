@@ -1,36 +1,87 @@
-# app.py — backend-1 (Stripe real): pagos + CORS + health
+# app.py — backend-1 (Stripe real): pagos + webhook + CORS + health
+# Nora · 2025-10-11
 import os, logging
 from logging.handlers import RotatingFileHandler
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
-from routes_payments import bp_pay
 
+# Blueprints
+try:
+    from routes_payments import bp_pay, create_checkout_session as _ccs  # _ccs para alias directo
+except Exception as e:
+    bp_pay = None
+    _ccs = None
+    print("Aviso: routes_payments no disponible:", e)
+
+try:
+    from routes_stripe_webhook import bp_webhook  # POST /webhooks/stripe
+except Exception as e:
+    bp_webhook = None
+    print("Aviso: routes_stripe_webhook no disponible:", e)
+
+# Lista blanca básica (puedes sobrescribir con FRONTEND_ORIGINS)
 ALLOWED_ORIGINS = {
     "http://localhost:5176",
     "http://127.0.0.1:5176",
-    "https://frontend-pagos.vercel.app",
+    "https://spainroom.vercel.app",
 }
+_extra = [o.strip() for o in (os.getenv("FRONTEND_ORIGINS") or "").replace(",", " ").split() if o.strip()]
+ALLOWED_ORIGINS.update(_extra)
 
 def create_app():
     app = Flask(__name__)
+    # CORS abierto con verificación fina en after_request
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
     @app.after_request
-    def add_cors_headers(resp):
+    def add_cors_headers(resp: Response):
         origin = request.headers.get("Origin", "")
-        if origin and (origin in ALLOWED_ORIGINS or origin.endswith(".vercel.app")):
+        # Permite *.vercel.app, localhost y los de la lista
+        allow = (
+            origin
+            and (
+                origin in ALLOWED_ORIGINS
+                or origin.endswith(".vercel.app")
+                or origin.startswith("http://localhost:")
+                or origin.startswith("http://127.0.0.1:")
+            )
+        )
+        if allow:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Vary"] = "Origin"
             resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Stripe-Signature"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Stripe-Signature"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
     _init_logging(app)
-    app.register_blueprint(bp_pay, url_prefix="/api/payments")
 
+    # === Pagos (Stripe) ===
+    if bp_pay:
+        # Ruta oficial con prefijo (coincide con lo que ya funciona en tus logs)
+        app.register_blueprint(bp_pay, url_prefix="/api/payments")
+
+        # Alias /create-checkout-session para compatibilidad con el front antiguo
+        if _ccs:
+            @app.route("/create-checkout-session", methods=["OPTIONS", "POST", "GET"])
+            def create_checkout_session_alias():
+                return _ccs()
+        app.logger.info("Blueprint pagos registrado.")
+    else:
+        app.logger.warning("Blueprint pagos NO disponible.")
+
+    # === Webhook Stripe ===
+    if bp_webhook:
+        app.register_blueprint(bp_webhook)  # expone POST /webhooks/stripe
+        app.logger.info("Webhook de Stripe registrado en /webhooks/stripe.")
+    else:
+        app.logger.warning("Webhook de Stripe NO disponible.")
+
+    # === Health ===
     @app.get("/health")
-    def health(): return jsonify(ok=True, service="spainroom-backend-1")
+    @app.get("/healthz")
+    def health():
+        return jsonify(ok=True, service="spainroom-backend-1")
 
     return app
 
