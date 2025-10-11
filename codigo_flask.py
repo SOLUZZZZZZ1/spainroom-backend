@@ -1,4 +1,5 @@
-# codigo_flask.py — Mínimo viable: health + pagos (Stripe) + CORS
+# codigo_flask.py — Backend-1 (Stripe + Health + CORS + rutas dobles)
+# Nora · 2025-10-11
 import os
 from urllib.parse import urljoin
 from flask import Flask, request, jsonify
@@ -6,13 +7,21 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 
-# ---- CORS (local + tu Vercel) ----
-ALLOWED_ORIGINS = [
+# ====== CORS ======
+# Permite lista desde env FRONTEND_ORIGINS o usa defaults seguros (localhost + Vercel)
+DEFAULT_ORIGINS = [
     "http://localhost:5176",
     "http://127.0.0.1:5176",
-    "https://frontend-pagos.vercel.app",
+    "https://spainroom.vercel.app",
 ]
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+ENV_ORIGINS = [o.strip() for o in (os.getenv("FRONTEND_ORIGINS") or "").replace(",", " ").split() if o.strip()]
+ALLOWED_ORIGINS = ENV_ORIGINS if ENV_ORIGINS else DEFAULT_ORIGINS
+
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=False,
+)
 
 def abs_url(origin: str, path_or_url: str) -> str:
     """Si nos pasan un path relativo, fabrico URL absoluta con el Origin."""
@@ -23,35 +32,40 @@ def abs_url(origin: str, path_or_url: str) -> str:
     base = (origin or "").rstrip("/") + "/"
     return urljoin(base, path_or_url.lstrip("/"))
 
-# ---- Health ----
+# ====== Health ======
+@app.get("/health")
 @app.get("/healthz")
 def healthz():
     return jsonify(ok=True), 200
 
-# ---- Pagos (Stripe) ----
+# ====== Pagos (Stripe) — alias dobles ======
 @app.route("/create-checkout-session", methods=["OPTIONS", "POST", "GET"])
+@app.route("/api/payments/create-checkout-session", methods=["OPTIONS", "POST", "GET"])
 def create_checkout_session():
     # Preflight CORS
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # GET informativo (para que no muestre 405 si se abre en el navegador)
+    # GET informativo (evita 405 si se visita en navegador)
     if request.method == "GET":
-        return jsonify(ok=True, info="Use POST con JSON: {amount (EUR), success_path|success_url, cancel_path|cancel_url}"), 200
+        return jsonify(ok=True, info="Use POST con JSON: {amount(EUR), success_path|success_url, cancel_path|cancel_url}"), 200
 
     data = request.get_json(silent=True) or {}
-    origin = request.headers.get("Origin") or os.getenv("FRONTEND_ORIGIN", "http://localhost:5176")
 
-    # Cantidad en EUR (int). Aceptamos amount o amount_eur.
+    # Origen del front (para construir URLs absolutas si mandan paths)
+    origin = request.headers.get("Origin") or os.getenv("FRONTEND_ORIGIN", ALLOWED_ORIGINS[0])
+
+    # Cantidad en EUR (acepta amount o amount_eur)
     amount_eur = data.get("amount", data.get("amount_eur"))
     try:
         amount_eur = int(amount_eur or 0)
     except Exception:
         amount_eur = 0
 
-    currency   = (data.get("currency") or "eur").lower()
+    currency    = (data.get("currency") or "eur").lower()
     success_url = data.get("success_url") or abs_url(origin, data.get("success_path") or "/?reserva=ok")
     cancel_url  = data.get("cancel_url")  or abs_url(origin, data.get("cancel_path")  or "/?reserva=error")
+
     stripe_key  = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
 
     # Sin clave → modo demo (redirige al success)
@@ -87,7 +101,7 @@ def create_checkout_session():
         # Fallback demo para no bloquear reservas si Stripe falla
         return jsonify(ok=True, demo=True, url=success_url, error=str(e))
 
-# ---- Factory para Gunicorn ----
+# ====== Factory para Gunicorn ======
 def create_app():
     return app
 
