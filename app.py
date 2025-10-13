@@ -1,5 +1,5 @@
-# app.py — backend-1 (Stripe real): pagos + webhook + CORS + health
-# Nora · 2025-10-11
+# app.py — backend-1 (Stripe real): pagos + webhook + CORS + health + VOZ (answer_cr)
+# Nora · 2025-10-13
 import os, logging
 from logging.handlers import RotatingFileHandler
 from flask import Flask, jsonify, request, Response
@@ -18,6 +18,13 @@ try:
 except Exception as e:
     bp_webhook = None
     print("Aviso: routes_stripe_webhook no disponible:", e)
+
+# === VOZ: responder Twilio con streaming a voice-cr ===
+try:
+    from routes_voice_answer_cr import bp_voice_answer_cr  # POST /voice/answer_cr
+except Exception as e:
+    bp_voice_answer_cr = None
+    print("Aviso: routes_voice_answer_cr no disponible:", e)
 
 # Lista blanca básica (puedes sobrescribir con FRONTEND_ORIGINS)
 ALLOWED_ORIGINS = {
@@ -58,10 +65,7 @@ def create_app():
 
     # === Pagos (Stripe) ===
     if bp_pay:
-        # Ruta oficial con prefijo (coincide con lo que ya funciona en tus logs)
         app.register_blueprint(bp_pay, url_prefix="/api/payments")
-
-        # Alias /create-checkout-session para compatibilidad con el front antiguo
         if _ccs:
             @app.route("/create-checkout-session", methods=["OPTIONS", "POST", "GET"])
             def create_checkout_session_alias():
@@ -72,10 +76,17 @@ def create_app():
 
     # === Webhook Stripe ===
     if bp_webhook:
-        app.register_blueprint(bp_webhook)  # expone POST /webhooks/stripe
+        app.register_blueprint(bp_webhook)  # POST /webhooks/stripe
         app.logger.info("Webhook de Stripe registrado en /webhooks/stripe.")
     else:
         app.logger.warning("Webhook de Stripe NO disponible.")
+
+    # === VOZ: Twilio answer → voice-cr stream ===
+    if bp_voice_answer_cr:
+        app.register_blueprint(bp_voice_answer_cr)  # /voice/answer_cr
+        app.logger.info("Blueprint voz (answer_cr) registrado.")
+    else:
+        app.logger.warning("Blueprint voz (answer_cr) NO disponible.")
 
     # === Health ===
     @app.get("/health")
