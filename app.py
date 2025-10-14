@@ -1,32 +1,31 @@
-# app.py — backend-1 (Stripe real): pagos + webhook + CORS + health + VOZ (answer_cr)
-# Nora · 2025-10-13
+# app.py — backend-1 (Stripe + Voice ConversationRelay + Webhook + CORS + Health)
+# Nora · 2025-10-14
 import os, logging
 from logging.handlers import RotatingFileHandler
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 
-# Blueprints
+# Blueprints Stripe
 try:
-    from routes_payments import bp_pay, create_checkout_session as _ccs  # _ccs para alias directo
+    from routes_payments import bp_pay, create_checkout_session as _ccs
 except Exception as e:
-    bp_pay = None
-    _ccs = None
+    bp_pay = None; _ccs = None
     print("Aviso: routes_payments no disponible:", e)
 
 try:
-    from routes_stripe_webhook import bp_webhook  # POST /webhooks/stripe
+    from routes_stripe_webhook import bp_webhook
 except Exception as e:
     bp_webhook = None
     print("Aviso: routes_stripe_webhook no disponible:", e)
 
-# === VOZ: responder Twilio con streaming a voice-cr ===
+# Voice ConversationRelay
 try:
-    from routes_voice_answer_cr import bp_voice_answer_cr  # POST /voice/answer_cr
+    from routes_voice_answer_cr import bp_voice_answer_cr
 except Exception as e:
     bp_voice_answer_cr = None
     print("Aviso: routes_voice_answer_cr no disponible:", e)
 
-# Lista blanca básica (puedes sobrescribir con FRONTEND_ORIGINS)
+# Orígenes permitidos (puedes sobrescribir con FRONTEND_ORIGINS)
 ALLOWED_ORIGINS = {
     "http://localhost:5176",
     "http://127.0.0.1:5176",
@@ -37,13 +36,12 @@ ALLOWED_ORIGINS.update(_extra)
 
 def create_app():
     app = Flask(__name__)
-    # CORS abierto con verificación fina en after_request
+    # CORS abierto + refinado en after_request
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
     @app.after_request
     def add_cors_headers(resp: Response):
         origin = request.headers.get("Origin", "")
-        # Permite *.vercel.app, localhost y los de la lista
         allow = (
             origin
             and (
@@ -63,7 +61,7 @@ def create_app():
 
     _init_logging(app)
 
-    # === Pagos (Stripe) ===
+    # === Pagos ===
     if bp_pay:
         app.register_blueprint(bp_pay, url_prefix="/api/payments")
         if _ccs:
@@ -76,17 +74,17 @@ def create_app():
 
     # === Webhook Stripe ===
     if bp_webhook:
-        app.register_blueprint(bp_webhook)  # POST /webhooks/stripe
-        app.logger.info("Webhook de Stripe registrado en /webhooks/stripe.")
+        app.register_blueprint(bp_webhook)   # POST /webhooks/stripe
+        app.logger.info("Webhook de Stripe registrado.")
     else:
         app.logger.warning("Webhook de Stripe NO disponible.")
 
-    # === VOZ: Twilio answer → voice-cr stream ===
+    # === VOZ: ConversationRelay ===
     if bp_voice_answer_cr:
-        app.register_blueprint(bp_voice_answer_cr)  # /voice/answer_cr
-        app.logger.info("Blueprint voz (answer_cr) registrado.")
+        app.register_blueprint(bp_voice_answer_cr)  # /voice/answer_cr y /voice/fallback
+        app.logger.info("Blueprint VOZ (ConversationRelay) registrado.")
     else:
-        app.logger.warning("Blueprint voz (answer_cr) NO disponible.")
+        app.logger.warning("Blueprint VOZ (ConversationRelay) NO disponible.")
 
     # === Health ===
     @app.get("/health")
@@ -103,8 +101,7 @@ def _init_logging(app: Flask):
     app.logger.addHandler(sh)
     try:
         fh = RotatingFileHandler("backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-        fh.setFormatter(fmt)
-        app.logger.addHandler(fh)
+        fh.setFormatter(fmt); app.logger.addHandler(fh)
     except Exception:
         pass
 
