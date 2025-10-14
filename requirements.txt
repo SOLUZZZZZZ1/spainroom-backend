@@ -22,3 +22,7 @@ PyJWT==2.10.1
 
 # Bot de voz
 twilio==9.2.3
+starlette==0.36.3
+uvicorn==0.30.6
+gunicorn==23.0.0
+
