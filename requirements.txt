@@ -22,5 +22,5 @@ PyJWT==2.10.1
 
 # Bot de voz
 twilio==9.2.3
-gunicorn==23.0.0
+
 
