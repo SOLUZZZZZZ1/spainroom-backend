@@ -1,41 +1,62 @@
-# routes_voice_answer_cr.py — SpainRoom Voice (Twilio → voice-cr)
+# routes_voice_answer_cr.py — Twilio Voice → ConversationRelay (voice-cr)
+# Nora · 2025-10-14
 import os
-from urllib.parse import urlencode
-from flask import Blueprint, request, make_response, current_app
+from flask import Blueprint, request, make_response, jsonify
 
 bp_voice_answer_cr = Blueprint("voice_answer_cr", __name__)
 
-VOICE_WS_URL = (os.getenv("VOICE_WS_URL") or "wss://voice-cr.onrender.com/cr").rstrip("/")
-GREETING = (
-    os.getenv("VOICE_GREETING")
-    or "Gracias por llamar a SpainRoom. Conectamos su audio para asistencia."
-).strip()
+def env(k, default=""):
+    return os.getenv(k, default)
 
-def _twiml(xml):
-    r = make_response(xml, 200)
-    r.headers["Content-Type"] = "application/xml"
-    return r
+def _twiml_cr():
+    """Construye TwiML <ConversationRelay> apuntando al WS del servicio VOZ (voice-cr)."""
+    ws_url     = env("VOICE_WS_URL", "").strip() or "wss://INVALID-WS-URL"
+    lang       = env("CR_LANGUAGE", "es-ES").strip()
+    trans_lang = env("CR_TRANSCRIPTION_LANGUAGE", lang).strip()
+    tts        = env("CR_TTS_PROVIDER", "Google").strip()
+    voice      = env("CR_VOICE", "").strip()
+    welcome    = env("CR_WELCOME", "").strip()
 
-@bp_voice_answer_cr.route("/voice/answer_cr", methods=["POST"])
-def answer_cr():
-    call_sid = request.form.get("CallSid", "")
-    from_num = request.form.get("From", "")
-    to_num = request.form.get("To", "")
+    attrs = [
+        f'url="{ws_url}"',
+        f'language="{lang}"',
+        f'transcriptionLanguage="{trans_lang}"',
+        f'ttsProvider="{tts}"',
+        'interruptible="speech"',
+        'reportInputDuringAgentSpeech="none"',
+    ]
+    if welcome:
+        attrs.append(f'welcomeGreeting="{welcome}"')
+    if voice:
+        attrs.append(f'voice="{voice}"')
 
-    qs = urlencode({"callSid": call_sid, "from": from_num, "to": to_num})
-    ws_url = f"{VOICE_WS_URL}?{qs}"
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # TwiML final
+    twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice" language="es-ES">{GREETING}</Say>
   <Connect>
-    <Stream url="{ws_url}" />
+    <ConversationRelay {' '.join(attrs)} />
   </Connect>
-</Response>"""
+</Response>'''
+    return twiml
 
-    try:
-        current_app.logger.info("[VOICE-CR] callSid=%s from=%s to=%s ws=%s",
-                                call_sid, from_num, to_num, ws_url)
-    except Exception:
-        pass
-    return _twiml(xml)
+@bp_voice_answer_cr.route("/voice/answer_cr", methods=["GET","POST"])
+def voice_answer_cr():
+    """Webhook Twilio (A CALL COMES IN) → ConversationRelay hacia voice-cr."""
+    return make_response(_twiml_cr(), 200, {"Content-Type": "application/xml"})
+
+@bp_voice_answer_cr.route("/voice/fallback", methods=["GET","POST"])
+def voice_fallback():
+    """Fallback opcional (mismo TwiML)."""
+    return make_response(_twiml_cr(), 200, {"Content-Type": "application/xml"})
+
+@bp_voice_answer_cr.route("/diag_runtime", methods=["GET"])
+def diag_runtime():
+    keys = [
+        "VOICE_WS_URL",
+        "CR_LANGUAGE",
+        "CR_TRANSCRIPTION_LANGUAGE",
+        "CR_TTS_PROVIDER",
+        "CR_VOICE",
+        "CR_WELCOME",
+    ]
+    return jsonify({k: env(k, "") for k in keys})
